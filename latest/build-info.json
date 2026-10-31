@@ -1,0 +1,9 @@
+{
+  "version": "2026-08-12",
+  "rows": 13538,
+  "rows_with_din": 13538,
+  "schema": 2,
+  "sha256": "cd374be1fcb970bd5781c1c463f6b7c7231a41ea731d1ac37ab26ff5b0697204",
+  "size": 9687040,
+  "note": "Seed: the index AlwaysMyCare bundles (built 2026-08-12, committed at 151d43fd on 13 Sept 2026). Replaced by the workflow's first publish."
+}

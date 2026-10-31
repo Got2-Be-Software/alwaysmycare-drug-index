@@ -1,0 +1,166 @@
+name: Weekly index
+
+# Builds Health Canada's Drug Product Database index and publishes it, with the manifest.json AlwaysMyCare reads, as a
+# GitHub release tagged with the build date. Only GitHub's built-in token is used: no secrets.
+# Nothing is published unless every step before the publish passes; a published release is never changed.
+# Every run, passed or failed, commits latest/last-run.json; the previous build record is read from the checkout,
+# never from a network answer. Where the token goes: actions/checkout takes it through its `token` input (default
+# github.token) to fetch this repository, and with persist-credentials: false does not leave it in .git/config;
+# actions/setup-python takes it through its `token` input (default github.token on github.com), which its action.yml
+# says "is only sent to GitHub-owned hosts"; the gh steps and the final push take it from `env`. The steps that build
+# and check the downloaded data never see it.
+
+on:
+  schedule:
+    - cron: '0 2 * * 0'   # Sundays 02:00 UTC, the time the AlwaysMyCare workflow used
+  workflow_dispatch:
+    inputs:
+      republish_from:
+        description: "Recovery only (README): the tag of an earlier good release to publish again under today's date"
+        required: false
+        default: ''
+
+permissions:
+  contents: write         # push latest/ and create the release; nothing else
+
+concurrency:
+  group: weekly-index
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # A manual run from any branch but the default would publish that branch's code and push its record there. A scheduled
+    # run has no event payload ("Webhook event payload: Not applicable"; GITHUB_REF "Default branch" — GitHub, Events that
+    # trigger workflows), so it is let through on its event name, never on github.event.repository.
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      REPO: ${{ github.repository }}
+      INDEX: dist/drugindex.sqlite
+      FROM: ${{ inputs.republish_from }}
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0, what @v4 resolved to on 2026-10-31
+        with:
+          persist-credentials: false   # (v2) no write token in .git/config while downloaded data is processed
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0, what @v5 resolved to on 2026-10-31
+        with:
+          python-version: '3.12'
+
+      - name: Name this build
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG=$(date -u +%Y-%m-%d)
+          # (v2) Only a clear 404 means "no release with this tag"; any other answer stops the run.
+          OUT=$(gh api --include "repos/$REPO/releases/tags/$TAG" 2>&1) && RC=0 || RC=$?
+          STATUS=$(printf '%s\n' "$OUT" | head -1 | awk '{print $2}')
+          case "$RC:$STATUS" in
+            1:404) ;;
+            0:200) echo "::error::a release $TAG already exists; a published release is never replaced"; exit 1 ;;
+            *)     echo "::error::could not tell whether release $TAG exists (exit $RC, status '${STATUS}')"; exit 1 ;;
+          esac
+          # A draft is not returned by tag; one left by an earlier failed run would make the tag ambiguous.
+          DRAFTS=$(gh api --paginate "repos/$REPO/releases?per_page=100" --jq "[.[] | select(.draft and .tag_name == \"$TAG\")] | length" | awk '{s+=$1} END {print s+0}')
+          [ "$DRAFTS" = 0 ] || { echo "::error::$DRAFTS draft(s) already carry tag $TAG; delete them by hand first"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Build the index
+        if: env.FROM == ''
+        run: python3 scripts/build_dpd_index.py
+
+      - name: Take the index from an earlier release (recovery)
+        if: env.FROM != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf from && mkdir -p from dist
+          gh release download "$FROM" --repo "$REPO" --pattern drugindex.sqlite --pattern manifest.json --pattern build-info.json --dir from
+          WANT=$(python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m["sha256"], m["size"])' from/manifest.json)
+          GOT="$(sha256sum from/drugindex.sqlite | cut -d' ' -f1) $(stat -c%s from/drugindex.sqlite)"
+          [ "$WANT" = "$GOT" ] || { echo "::error::$FROM's index is $GOT; its manifest says $WANT"; exit 1; }
+          cp from/drugindex.sqlite "$INDEX"
+
+      - name: Check the index and write the manifest
+        # The previous record is the committed latest/build-info.json (seeded with the index AlwaysMyCare bundles). A recovery
+        # compares rows with the source release's own record, so the bad release it replaces can't refuse it.
+        run: |
+          set -euo pipefail
+          if [ -n "$FROM" ]; then
+            python3 scripts/check_index.py "$INDEX" "${{ steps.tag.outputs.tag }}" "$REPO" latest/build-info.json from/build-info.json
+          else
+            python3 scripts/check_index.py "$INDEX" "${{ steps.tag.outputs.tag }}" "$REPO" latest/build-info.json
+          fi
+
+      - name: Create the release as a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          NOTE="Health Canada Drug Product Database index built $TAG."
+          [ -z "$FROM" ] || NOTE="Republished on $TAG from release $FROM (recovery)."
+          gh release create "$TAG" "$INDEX" dist/manifest.json dist/build-info.json \
+            --repo "$REPO" --draft --target "$(git rev-parse HEAD)" --title "Index $TAG" \
+            --notes "$NOTE Contains information licensed under the Open Government Licence – Canada."
+
+      - name: Check the draft's files against the manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          NAMES=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '[.assets[].name] | sort | join(",")')
+          [ "$NAMES" = "build-info.json,drugindex.sqlite,manifest.json" ] || { echo "::error::draft assets are $NAMES"; exit 1; }
+          rm -rf check && mkdir check
+          gh release download "$TAG" --repo "$REPO" --dir check
+          cmp check/manifest.json dist/manifest.json
+          WANT=$(python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m["sha256"], m["size"])' dist/manifest.json)
+          GOT="$(sha256sum check/drugindex.sqlite | cut -d' ' -f1) $(stat -c%s check/drugindex.sqlite)"
+          [ "$WANT" = "$GOT" ] || { echo "::error::uploaded index is $GOT; the manifest says $WANT"; exit 1; }
+
+      - name: Publish
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${{ steps.tag.outputs.tag }}" --repo "$REPO" --draft=false --latest
+
+      - name: Read it back as the app does
+        # (v2) Anonymous; every redirect hop must pass the app's host rule; a stale "latest" is retried for ~2 minutes.
+        run: python3 -I scripts/read_back.py "$REPO" dist/manifest.json "$INDEX"
+
+      - name: Record this run in the repository
+        # (v2) Runs whatever happened above, so the repository has activity every week the schedule runs (GitHub disables
+        # a public repository's scheduled workflows after 60 days without activity; it does not say a commit pushed with
+        # this token counts — see README, "Who watches this"). The build record moves only when a release was published.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ job.status }}
+          PUBLISHED: ${{ steps.publish.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p latest
+          if [ "$PUBLISHED" = true ]; then cp dist/manifest.json latest/manifest.json; cp dist/build-info.json latest/build-info.json; fi
+          D="$(date -u +%Y-%m-%dT%H:%MZ)" T="${{ steps.tag.outputs.tag }}" python3 -I -c 'import json,os; json.dump({"date": os.environ["D"], "run": os.environ["GITHUB_RUN_ID"], "outcome": os.environ["OUTCOME"], "published": os.environ["PUBLISHED"] == "true", "tag": os.environ["T"]}, open("latest/last-run.json", "w"), indent=2); open("latest/last-run.json", "a").write("\n")'
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add latest/
+          git commit -m "Run ${GITHUB_RUN_ID}: ${OUTCOME}${{ steps.publish.outcome == 'success' && format(', published {0}', steps.tag.outputs.tag) || '' }}"
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Weekly index ${{ steps.tag.outputs.tag }}"
+            if [ -f dist/build-info.json ]; then echo '```json'; cat dist/build-info.json; echo '```'; fi
+          } >> "$GITHUB_STEP_SUMMARY"
