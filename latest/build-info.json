@@ -1,8 +1,8 @@
 {
-  "version": "2026-11-01",
-  "rows": 13356,
-  "rows_with_din": 13356,
+  "version": "2026-11-08",
+  "rows": 13379,
+  "rows_with_din": 13379,
   "schema": 2,
-  "sha256": "80ddd183c93ebe591f73c9c9ab2415f700cac441b34f475fa3facf0e0e35ade9",
-  "size": 9539584
+  "sha256": "86df6aa9dcb1925460d7d459639df5fb147f0594a3182a5cd6367bf8bedc6b7f",
+  "size": 9547776
 }
