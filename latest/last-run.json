@@ -1,7 +1,7 @@
 {
-  "date": "2026-11-08T08:23Z",
-  "run": "42462728746",
-  "outcome": "success",
-  "published": true,
-  "tag": "2026-11-08"
+  "date": "2026-11-15T08:40Z",
+  "run": "43695551454",
+  "outcome": "failure",
+  "published": false,
+  "tag": "2026-11-15"
 }
